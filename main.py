@@ -145,9 +145,25 @@ class SlackMessageAnalyzer:
 
         # ランキングテキストの生成
         ranking_lines = []
-        for user_id, count in counts.most_common():
+
+        # 上位のユーザーを取得
+        top_users = counts.most_common()
+
+        # 各ユーザーに対して順位に応じてメダル絵文字を付与
+        for i, (user_id, count) in enumerate(top_users):
             name = self.user_map.get(user_id, user_id)
-            ranking_lines.append(f"{name}: {count}回")
+
+            # 順位に基づいてメダル絵文字を追加
+            if i == 0:
+                medal = "🥇 "  # 1位
+            elif i == 1:
+                medal = "🥈 "  # 2位
+            elif i == 2:
+                medal = "🥉 "  # 3位
+            else:
+                medal = "   "  # それ以外（スペースでインデント調整）
+
+            ranking_lines.append(f"{medal}{name}: {count}回")
 
         ranking_text = "\n".join(ranking_lines)
 
