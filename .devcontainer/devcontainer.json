@@ -1,0 +1,6 @@
+{
+  "name": "Slack API Counter",
+  "build": {
+    "dockerfile": "Dockerfile"
+  }
+}
