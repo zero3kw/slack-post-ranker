@@ -3,112 +3,207 @@ from collections import Counter
 import time
 from datetime import datetime, timedelta
 import argparse
+from typing import Dict, List, Any, Optional, Tuple
 
-def fetch_all_messages(token, channel_id, days):
-    url = 'https://slack.com/api/conversations.history'
-    headers = {'Authorization': f'Bearer {token}'}
-    messages = []
-    has_more = True
-    cursor = None
 
-    oldest_ts = int(time.time() - days * 86400)
+class SlackApiClient:
+    """Slack API通信を担当するクラス"""
 
-    while has_more:
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self.headers = {'Authorization': f'Bearer {token}'}
+        self.base_url = 'https://slack.com/api'
+
+    def _make_request(self, endpoint: str, params: Dict[str, Any] = None) -> Dict:
+        """APIリクエストを実行し、レスポンスを返す"""
+        url = f"{self.base_url}/{endpoint}"
+        response = requests.get(url, headers=self.headers, params=params)
+
+        # 接続エラーのケースをハンドリング
+        try:
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ 接続エラー: {e}")
+            return {"ok": False, "error": str(e)}
+
+        data = response.json()
+
+        if not data.get("ok"):
+            print(f"⚠️ API エラー ({endpoint}): {data.get('error')}")
+
+        return data
+
+    def fetch_messages(self, channel_id: str, oldest_ts: int, cursor: Optional[str] = None) -> Dict:
+        """特定チャンネルのメッセージを取得"""
         params = {
             'channel': channel_id,
             'limit': 300,
             'oldest': oldest_ts
         }
+
         if cursor:
             params['cursor'] = cursor
 
-        res = requests.get(url, headers=headers, params=params).json()
+        return self._make_request('conversations.history', params)
+
+    def fetch_users(self) -> Dict:
+        """ユーザー一覧を取得"""
+        return self._make_request('users.list')
+
+    def post_message(self, channel_id: str, blocks: List[Dict]) -> Dict:
+        """チャンネルにメッセージを投稿"""
+        url = f"{self.base_url}/chat.postMessage"
+
+        payload = {
+            "channel": channel_id,
+            "blocks": blocks,
+        }
+
+        response = requests.post(url, headers={**self.headers, "Content-Type": "application/json"}, json=payload)
+
+        try:
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ 投稿接続エラー: {e}")
+            return {"ok": False, "error": str(e)}
+
+        data = response.json()
+
+        if not data.get("ok"):
+            print(f"⚠️ 投稿失敗: {data.get('error')}")
+
+        return data
+
+
+class SlackMessageAnalyzer:
+    """メッセージ分析とレポート生成を担当するクラス"""
+
+    def __init__(self, client: SlackApiClient) -> None:
+        self.client = client
+        self.user_map = {}
+
+    def fetch_all_messages(self, channel_id: str, days: int) -> List[Dict]:
+        """指定期間内のすべてのメッセージを取得"""
+        messages = []
+        has_more = True
+        cursor = None
+
+        oldest_ts = int(time.time() - days * 86400)
+
+        print(f"✅ メッセージ取得中...（過去{days}日間）")
+
+        while has_more:
+            res = self.client.fetch_messages(channel_id, oldest_ts, cursor)
+
+            if not res.get("ok"):
+                break
+
+            messages.extend(res.get('messages', []))
+            has_more = res.get('has_more', False)
+            cursor = res.get('response_metadata', {}).get('next_cursor')
+
+            # レート制限を考慮
+            time.sleep(1)
+
+        print(f"取得メッセージ数: {len(messages)} 件")
+        return messages
+
+    def load_user_data(self) -> None:
+        """ユーザー情報を取得してマッピングを作成"""
+        print("✅ ユーザー情報取得中...")
+
+        res = self.client.fetch_users()
 
         if not res.get("ok"):
-            print("⚠️ エラー:", res.get("error"))
-            break
+            return
 
-        messages.extend(res.get('messages', []))
-        has_more = res.get('has_more', False)
-        cursor = res.get('response_metadata', {}).get('next_cursor')
-        time.sleep(1)
+        self.user_map = {
+            user['id']: user.get('profile', {}).get('display_name') or
+                       user.get('profile', {}).get('real_name') or
+                       user['id']
+            for user in res.get('members', [])
+        }
 
-    return messages
+    def count_messages_by_user(self, messages: List[Dict]) -> Counter:
+        """ユーザーごとのメッセージ数をカウント"""
+        counter = Counter()
 
-def get_usernames(token):
-    url = 'https://slack.com/api/users.list'
-    headers = {'Authorization': f'Bearer {token}'}
-    res = requests.get(url, headers=headers).json()
+        for msg in messages:
+            if (
+                'user' in msg and
+                msg.get('subtype') is None and
+                'bot_id' not in msg
+            ):
+                counter[msg['user']] += 1
 
-    if not res.get("ok"):
-        print("⚠️ ユーザー一覧取得失敗:", res.get("error"))
-        return {}
+        return counter
 
-    return {
-        user['id']: user.get('profile', {}).get('display_name') or
-                    user.get('profile', {}).get('real_name') or
-                    user['id']
-        for user in res.get('members', [])
-    }
+    def generate_ranking_report(self, counts: Counter, days: int) -> Tuple[str, List[Dict]]:
+        """ランキングレポートのテキストとブロックを生成"""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
 
-def count_messages_by_user(messages):
-    counter = Counter()
-    for msg in messages:
-        if 'user' in msg and msg.get('subtype') is None:
-            counter[msg['user']] += 1
-    return counter
+        # ランキングテキストの生成
+        ranking_lines = []
+        for user_id, count in counts.most_common():
+            name = self.user_map.get(user_id, user_id)
+            ranking_lines.append(f"{name}: {count}回")
 
-def format_ranking(counts, user_map):
-    lines = []
-    for user_id, count in counts.most_common():
-        name = user_map.get(user_id, user_id)
-        lines.append(f"{name}: {count}回")
-    return "\n".join(lines)
+        ranking_text = "\n".join(ranking_lines)
 
-def post_to_slack(token, channel_id, message):
-    url = "https://slack.com/api/chat.postMessage"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "channel": channel_id,
-        "icon_emoji": ":robot_face:",
-        "text": message
-    }
-    res = requests.post(url, headers=headers, json=payload).json()
+        # 期間を含むサマリーの作成
+        summary = f"*📊投稿数ランキング（期間：{start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}）*\n"
+        summary += ranking_text
 
-    if not res.get("ok"):
-        print("⚠️ 投稿失敗:", res.get("error"))
-    else:
-        print("✅ 結果をSlackに投稿しました")
+        # Slackブロックの作成
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"{summary}"
+                }
+            }
+        ]
 
-def main():
+        return summary, blocks
+
+
+def main() -> None:
+    """メイン実行関数"""
     parser = argparse.ArgumentParser(description="Slack投稿数ランキング")
     parser.add_argument('--token', required=True, help='Slack Bot Token')
     parser.add_argument('--channel', required=True, help='Slack Channel ID')
     parser.add_argument('--days', type=int, default=7, help='何日前から取得するか（デフォルト: 7日）')
+    parser.add_argument('--dry-run', action='store_true', help='Slackに投稿せず内容だけ表示')
+
     args = parser.parse_args()
 
-    slack_token = args.token
-    channel_id = args.channel
-    days = args.days
+    # クライアントの初期化
+    client = SlackApiClient(args.token)
+    analyzer = SlackMessageAnalyzer(client)
 
-    print(f"✅ メッセージ取得中...（過去{days}日間）")
-    messages = fetch_all_messages(slack_token, channel_id, days)
-    print(f"取得メッセージ数: {len(messages)} 件")
+    # ユーザー情報の取得
+    analyzer.load_user_data()
 
-    print("✅ ユーザー情報取得中...")
-    user_map = get_usernames(slack_token)
+    # メッセージの取得
+    messages = analyzer.fetch_all_messages(args.channel, args.days)
 
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days)
-    counts = count_messages_by_user(messages)
+    # カウント集計
+    counts = analyzer.count_messages_by_user(messages)
 
-    summary = f"📊 投稿数ランキング（期間：{start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}）\n"
-    summary += format_ranking(counts, user_map)
+    # レポート生成
+    summary, blocks = analyzer.generate_ranking_report(counts, args.days)
 
-    post_to_slack(slack_token, channel_id, summary)
+    # 結果の出力/投稿
+    if args.dry_run:
+        print("✅ [dry-run] 投稿内容:")
+        print(summary)
+    else:
+        res = client.post_message(args.channel, blocks)
+        if res.get("ok"):
+            print("✅ Slackに投稿しました")
+
 
 if __name__ == '__main__':
     main()
